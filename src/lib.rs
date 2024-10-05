@@ -48,10 +48,7 @@ impl QueryCacheConfig {
     }
 }
 
-pub fn with_query_cache(
-    builder: SessionStateBuilder,
-    config: QueryCacheConfig,
-) -> SessionStateBuilder {
+pub fn with_query_cache(builder: SessionStateBuilder, config: QueryCacheConfig) -> SessionStateBuilder {
     let config = Arc::new(config);
     builder
         .with_query_planner(Arc::new(QueryCacheQueryPlanner::default()))
@@ -68,8 +65,7 @@ impl QueryPlanner for QueryCacheQueryPlanner {
         logical_plan: &LogicalPlan,
         session_state: &SessionState,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        let planners: Vec<Arc<dyn ExtensionPlanner + Send + Sync>> =
-            vec![Arc::new(QCAggregateExecPlanner::default())];
+        let planners: Vec<Arc<dyn ExtensionPlanner + Send + Sync>> = vec![Arc::new(QCAggregateExecPlanner::default())];
 
         DefaultPhysicalPlanner::with_extension_planners(planners)
             .create_physical_plan(logical_plan, session_state)

@@ -39,11 +39,7 @@ async fn session_ctx() -> SessionContext {
 
 fn create_data() -> RecordBatch {
     let schema = Arc::new(Schema::new(vec![
-        Field::new(
-            "timestamp",
-            DataType::Timestamp(TimeUnit::Microsecond, None),
-            false,
-        ),
+        Field::new("timestamp", DataType::Timestamp(TimeUnit::Microsecond, None), false),
         Field::new("service", DataType::Utf8, true),
         Field::new("value", DataType::Int64, true),
     ]));

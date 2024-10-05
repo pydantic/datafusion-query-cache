@@ -1,5 +1,12 @@
-use crate::QueryCacheConfig;
+use std::any::Any;
+use std::fmt;
+use std::fmt::Formatter;
+use std::hash::Hash;
+use std::sync::Arc;
+
 use async_trait::async_trait;
+use datafusion::arrow::array::RecordBatch;
+use datafusion::arrow::util::pretty::print_batches;
 use datafusion::common::tree_node::Transformed;
 use datafusion::common::{plan_err, Column, DFSchemaRef, Result as DataFusionResult};
 use datafusion::execution::{SendableRecordBatchStream, SessionState, TaskContext};
@@ -11,13 +18,13 @@ use datafusion::logical_expr::{
 use datafusion::optimizer::optimizer::ApplyOrder;
 use datafusion::optimizer::{OptimizerConfig, OptimizerRule};
 use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
-use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
+use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::{collect, DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
-use std::any::Any;
-use std::fmt;
-use std::fmt::Formatter;
-use std::hash::Hash;
-use std::sync::Arc;
+use futures::TryFutureExt;
+
+use crate::QueryCacheConfig;
 
 #[derive(Debug)]
 pub(crate) struct QCAggregateOptimizerRule {
@@ -61,24 +68,16 @@ impl OptimizerRule for QCAggregateOptimizerRule {
     }
 
     // Example rewrite pass to insert a user defined LogicalPlanNode
-    fn rewrite(
-        &self,
-        plan: LogicalPlan,
-        _config: &dyn OptimizerConfig,
-    ) -> DataFusionResult<Transformed<LogicalPlan>> {
+    fn rewrite(&self, plan: LogicalPlan, _config: &dyn OptimizerConfig) -> DataFusionResult<Transformed<LogicalPlan>> {
         // println!("rewrite -> {}", plan.display());
         let LogicalPlan::Aggregate(agg) = &plan else {
             // not an aggregation, continue rewrite
             return Ok(Transformed::no(plan));
         };
 
-        let Aggregate {
-            input, group_expr, ..
-        } = agg;
+        let Aggregate { input, group_expr, .. } = agg;
         let agg_input = input.as_ref().clone();
-        let mut temporal_group_bys = group_expr
-            .iter()
-            .filter_map(|e| self.find_temporal_group_by(e));
+        let mut temporal_group_bys = group_expr.iter().filter_map(|e| self.find_temporal_group_by(e));
 
         let Some(temporal_group_by) = temporal_group_bys.next() else {
             // no temporal group by, do nothing
@@ -128,11 +127,7 @@ impl fmt::Display for QCAggregatePlanNode {
 }
 
 impl QCAggregatePlanNode {
-    fn new(
-        input: LogicalPlan,
-        temporal_group_by: Column,
-        dynamic_lower_bound: Option<BinaryExpr>,
-    ) -> Self {
+    fn new(input: LogicalPlan, temporal_group_by: Column, dynamic_lower_bound: Option<BinaryExpr>) -> Self {
         Self {
             input,
             temporal_group_by,
@@ -167,11 +162,7 @@ impl UserDefinedLogicalNodeCore for QCAggregatePlanNode {
         write!(f, "group by cache for {}", self.input.display())
     }
 
-    fn with_exprs_and_inputs(
-        &self,
-        exprs: Vec<Expr>,
-        inputs: Vec<LogicalPlan>,
-    ) -> DataFusionResult<Self> {
+    fn with_exprs_and_inputs(&self, exprs: Vec<Expr>, inputs: Vec<LogicalPlan>) -> DataFusionResult<Self> {
         let mut iter_exprs = exprs.into_iter();
         let Some(Expr::Column(column)) = iter_exprs.next() else {
             return plan_err!("expected temporal column");
@@ -223,61 +214,90 @@ impl ExtensionPlanner for QCAggregateExecPlanner {
             return plan_err!("QueryCacheGroupByExec expected one input");
         }
 
-        let expr = physical_inputs[0].clone();
+        let exec = physical_inputs[0].clone();
 
-        if expr.as_any().downcast_ref::<QCAggregateExec>().is_some() {
-            // already a `QCAggregateExec`, return it
-            return Ok(Some(expr));
+        if find_existing_inner_exec(&exec) {
+            // already a `QCInnerAggregateExec` (or contains a `QCInnerAggregateExec`), return it
+            return Ok(Some(exec));
         }
 
-        let Some(agg_exec): Option<&AggregateExec> = expr.as_any().downcast_ref() else {
+        let Some(agg_exec): Option<&AggregateExec> = exec.as_any().downcast_ref() else {
             // TODO if this can actually happen return `Ok(Some(expr))`
             return plan_err!("QueryCacheGroupByExec expected one AggregateExec input");
         };
 
-        // TODO is this always true?
-        assert!(
-            matches!(
-                agg_exec.mode(),
-                AggregateMode::Partial | AggregateMode::FinalPartitioned
-            ),
-            "agg_exec mode must be Partial"
-        );
-
-        Ok(Some(Arc::new(QCAggregateExec::new(
-            expr,
+        let input_exec = QCInnerAggregateExec::try_new(
+            agg_exec.input().clone(),
             group_by_node.temporal_group_by.clone(),
             group_by_node.dynamic_lower_bound.clone(),
-        ))))
+        )?;
+
+        // let input_exec = Arc::new(CoalescePartitionsExec::new(input_exec));
+        let input_schema = input_exec.schema();
+
+        Ok(Some(Arc::new(AggregateExec::try_new(
+            AggregateMode::Final,
+            agg_exec.group_expr().clone(),
+            agg_exec.aggr_expr().to_vec(),
+            agg_exec.filter_expr().to_vec(),
+            input_exec,
+            input_schema,
+        )?)))
+    }
+}
+
+/// check for an existing `QCInnerAggregateExec` in the plan
+fn find_existing_inner_exec(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    match plan.name() {
+        "QueryCacheAggregateExec" => true,
+        "CoalescePartitionsExec" => {
+            let coalesce = plan.as_any().downcast_ref::<CoalescePartitionsExec>().unwrap();
+            find_existing_inner_exec(coalesce.input())
+        }
+        "AggregateExec" => {
+            let agg = plan.as_any().downcast_ref::<AggregateExec>().unwrap();
+            find_existing_inner_exec(agg.input())
+        }
+        _ => false,
+        // name => {
+        //     dbg!(name);
+        //     false
+        // }
     }
 }
 
 #[derive(Debug)]
-struct QCAggregateExec {
+struct QCInnerAggregateExec {
     input: Arc<dyn ExecutionPlan>,
     temporal_group_by: Column,
     dynamic_lower_bound: Option<BinaryExpr>,
     cache: PlanProperties,
 }
 
-impl QCAggregateExec {
-    fn new(
+impl QCInnerAggregateExec {
+    fn try_new(
         input: Arc<dyn ExecutionPlan>,
         temporal_group_by: Column,
         dynamic_lower_bound: Option<BinaryExpr>,
-    ) -> Self {
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         let cache = input.properties().clone();
 
-        Self {
+        let input = if input.name() == "CoalescePartitionsExec" {
+            input
+        } else {
+            Arc::new(CoalescePartitionsExec::new(input))
+        };
+
+        Ok(Arc::new(Self {
             input,
             temporal_group_by,
             dynamic_lower_bound,
             cache,
-        }
+        }))
     }
 }
 
-impl DisplayAs for QCAggregateExec {
+impl DisplayAs for QCInnerAggregateExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut Formatter) -> fmt::Result {
         match t {
             DisplayFormatType::Default => write!(f, "{}({})", self.name(), self.input.name()),
@@ -287,7 +307,7 @@ impl DisplayAs for QCAggregateExec {
 }
 
 #[async_trait]
-impl ExecutionPlan for QCAggregateExec {
+impl ExecutionPlan for QCInnerAggregateExec {
     fn name(&self) -> &str {
         "QueryCacheAggregateExec"
     }
@@ -309,25 +329,32 @@ impl ExecutionPlan for QCAggregateExec {
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         if children.len() == 1 {
-            Ok(Arc::new(Self::new(
+            Self::try_new(
                 children[0].clone(),
                 self.temporal_group_by.clone(),
                 self.dynamic_lower_bound.clone(),
-            )))
+            )
         } else {
             plan_err!("QueryCacheGroupByExec expected one child")
         }
     }
 
-    fn execute(
-        &self,
-        partition: usize,
-        context: Arc<TaskContext>,
-    ) -> DataFusionResult<SendableRecordBatchStream> {
-        // println!("self: {}, input: {}", self.name(), self.input.name());
-        // for now just call the child
-        self.input.execute(partition, context)
+    fn execute(&self, partition: usize, context: Arc<TaskContext>) -> DataFusionResult<SendableRecordBatchStream> {
+        assert_eq!(partition, 0, "QCAggregateExec does not support partitioning");
+        Ok(Box::pin(RecordBatchStreamAdapter::new(
+            self.input.schema(),
+            async_execute(self.input.clone(), context)
+                .map_ok(|partitions| futures::stream::iter(partitions.into_iter().map(Ok)))
+                .try_flatten_stream(),
+        )))
     }
+}
+
+async fn async_execute(input: Arc<dyn ExecutionPlan>, context: Arc<TaskContext>) -> DataFusionResult<Vec<RecordBatch>> {
+    // TODO store the result for future use
+    let batches = collect(input, context).await?;
+    print_batches(&batches)?;
+    Ok(batches)
 }
 
 /// Find a binary expression which must have the form `{column} >(=) {something with now()}` represents a
