@@ -17,9 +17,9 @@ What's supported:
 [`QueryPlanner`](https://docs.rs/datafusion/latest/datafusion/execution/context/trait.QueryPlanner.html),
 [`OptimizerRule`](https://docs.rs/datafusion/latest/datafusion/optimizer/trait.OptimizerRule.html),
 [`UserDefinedLogicalNodeCore`](https://docs.rs/datafusion/latest/datafusion/logical_expr/trait.UserDefinedLogicalNodeCore.html) and
-[`ExecutionPlan`](https://docs.rs/datafusion/latest/datafusion/physical_plan/trait.ExecutionPlan.html)
+[`ExecutionPlan`](https://docs.rs/datafusion/latest/datafusion/physical_plan/trait.ExecutionPlan.html).
 
-Usage is as simple as calling `with_query_cache`, here's a complete (if minimal) example of creating `SessionContext`:
+Usage is as simple as calling `with_query_cache`, here's a complete (if minimal) example of creating a `SessionContext`:
 
 ```rs
 async fn session_ctx() -> SessionContext {
@@ -64,14 +64,14 @@ then combining it with a query on the last 10 minutes of data to get a result.
 
 **That's what `datafusion-query-cache` does!**
 
-## How it works (the (slightly) longer version)
+## How it works (the longer version)
 
 Some people reading the above example will already being asking
 
 > But combining max values is easy (you just take the max of the maxes), what about more complex queries?
 > If we had used `avg` instead of `max` you can't combine to averages by just averaging them.
 
-The best bit is: DataFusion already has all the machinery to combine queries, so `datafusion-query-cache`
+The best bit is: DataFusion already has all the machinery to combine partial query results, so `datafusion-query-cache`
 doesn't need any special logic for different aggregations, indeed it doesn't even know what they are.
 
 Instead we just hook into the right place in the physical plan to provide the cached results, constrain the query
@@ -104,17 +104,18 @@ AggegateExec {
 
 Notice how the `input` for the top level `AggegateExec` is another `AggegateExec`?
 That's DataFusion allowing parallel execution by splitting the data into chunks and aggregating them separately.
-The output of the inner `AggegateExec` looks like this (note `mode: Parital`):
+The output of the inner `AggegateExec` (note `mode: Parital`) will look something like:
 
 | `avg(price)[count]` | `avg(price)[sum]` |
 |---------------------|-------------------|
 | 123.4               | 1000              |
 | 125.4               | 1000              |
 | 127.4               | 1000              |
+| ...                 | ...               |
 
 The top level `AggegateExec` with (`mode: Final`), then combines these partial results to get the final answer.
 
-This "combine partial results" is exactly what `datafusion-query-cache` ues to combine the cached result with the new data.
+This "combine partial results" is exactly what `datafusion-query-cache` uses to combine the cached result with the new data.
 
 So `datafusion-query-cache`, would rewrite the above query to have the following physical plan:
 
@@ -143,3 +144,20 @@ AggegateExec {
     }
 }
 ```
+
+The beauty is, if we wrote a more complex query, say:
+
+```sql
+SELECT
+    date_trunc('hour', timestamp) AS time_bucket,
+    round(avg(value), 2) as avg_value,
+    round(min(value), 2) as min_value,
+    round(max(value), 2) as max_value
+FROM stock_prices
+WHERE symbol = 'AAPL' AND timestamp > '2021-01-01'
+GROUP BY time_bucket
+ORDER BY time_bucket DESC
+```
+
+`datafusion-query-cache` doesn't need to be any cleverer, DataFusion does the hard work of combining the partial results,
+even accounting for the different buckets and aggregations and combining them correctly.
