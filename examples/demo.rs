@@ -51,21 +51,18 @@ fn create_data() -> RecordBatch {
     ]));
 
     // 2024-01-01 00:00:00
-    let mut timestamp = 1704067200000000;
+    let mut timestamp = 1_704_067_200_000_000;
     let count = 10_000;
     let mut timestamps = Vec::with_capacity(count);
     let mut service_names = Vec::with_capacity(count);
     let mut values = Vec::with_capacity(count);
 
-    let mut seed = 0i64;
-
-    for _ in 0..50_000 {
+    for seed in 0..50_000 {
         // 0 - 999_000 us, so 0 - 0.999 s
         timestamps.push(timestamp);
         timestamp += 1_000_000;
-        service_names.push(SERVICES[seed as usize % 5]);
+        service_names.push(SERVICES[usize::try_from(seed).unwrap() % 5]);
         values.push(seed % 500);
-        seed += 1;
     }
 
     RecordBatch::try_new(

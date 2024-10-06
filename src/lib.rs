@@ -15,8 +15,8 @@ use datafusion::physical_planner::{DefaultPhysicalPlanner, ExtensionPlanner, Phy
 
 use aggregate::{QCAggregateExecPlanner, QCAggregateOptimizerRule};
 pub use cache::MemoryQueryCache;
-pub use log::{LogNoOp, LogStderrColors};
 use cache::QueryCache;
+pub use log::{LogNoOp, LogStderrColors};
 
 #[derive(Debug)]
 pub struct QueryCacheConfig {
@@ -70,7 +70,11 @@ pub fn with_query_cache(builder: SessionStateBuilder, config: QueryCacheConfig) 
     with_query_cache_log(builder, config, LogNoOp)
 }
 
-pub fn with_query_cache_log<Log: log::AbstractLog>(builder: SessionStateBuilder, config: QueryCacheConfig, log: Log) -> SessionStateBuilder {
+pub fn with_query_cache_log<Log: log::AbstractLog>(
+    builder: SessionStateBuilder,
+    config: QueryCacheConfig,
+    log: Log,
+) -> SessionStateBuilder {
     let config = Arc::new(config);
     builder
         .with_query_planner(Arc::new(QueryCacheQueryPlanner::new(log.clone(), config.clone())))
@@ -96,8 +100,10 @@ impl<Log: log::AbstractLog> QueryPlanner for QueryCacheQueryPlanner<Log> {
         logical_plan: &LogicalPlan,
         session_state: &SessionState,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        let planners: Vec<Arc<dyn ExtensionPlanner + Send + Sync>> =
-            vec![Arc::new(QCAggregateExecPlanner::new(self.log.clone(), self.config.clone()))];
+        let planners: Vec<Arc<dyn ExtensionPlanner + Send + Sync>> = vec![Arc::new(QCAggregateExecPlanner::new(
+            self.log.clone(),
+            self.config.clone(),
+        ))];
 
         DefaultPhysicalPlanner::with_extension_planners(planners)
             .create_physical_plan(logical_plan, session_state)

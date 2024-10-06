@@ -13,3 +13,10 @@ termcolor = "1.4.1"
 
 [dev-dependencies]
 tokio = { version = "1.40.0", features = ["full"] }
+
+[lints.clippy]
+dbg_macro = "deny"
+pedantic = { level = "deny", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+return_self_not_must_use = "allow"

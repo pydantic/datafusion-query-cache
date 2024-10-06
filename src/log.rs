@@ -1,6 +1,6 @@
 use std::fmt;
+use std::io::{Result as IoResult, Write};
 use std::sync::{Arc, Mutex};
-use std::io::{Write, Result as IoResult};
 
 use datafusion::common::{DataFusionError, Result as DataFusionResult};
 
@@ -24,7 +24,7 @@ pub trait AbstractLog: Send + Sync + fmt::Debug + Clone + 'static {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub enum Level {
     Info,
     Warn,
@@ -49,13 +49,13 @@ impl AbstractLog for LogNoOp {
 
 #[derive(Debug, Clone, Default)]
 pub struct LogStderrColors {
-    last_fingerprint: Arc<Mutex<String>>
+    last_fingerprint: Arc<Mutex<String>>,
 }
 
 impl LogStderrColors {
     fn log_inner(&self, level: Level, query_fingerprint: &str, message: impl fmt::Display) -> IoResult<()> {
         // here so it works with features
-        use termcolor::{Color, ColorChoice, ColorSpec, WriteColor, BufferWriter};
+        use termcolor::{BufferWriter, Color, ColorChoice, ColorSpec, WriteColor};
 
         let mut last_fingerprint = self.last_fingerprint.lock().unwrap();
 
@@ -64,20 +64,20 @@ impl LogStderrColors {
         if *last_fingerprint != query_fingerprint {
             *last_fingerprint = query_fingerprint.to_string();
             buffer.set_color(ColorSpec::new().set_fg(Some(Color::Green)))?;
-            writeln!(&mut buffer, "{}", query_fingerprint)?;
+            writeln!(&mut buffer, "{query_fingerprint}")?;
         }
 
         match level {
             Level::Info => {
                 buffer.set_color(ColorSpec::new().set_fg(Some(Color::Blue)))?;
-                write!(&mut buffer, "         {}", message)?;
+                write!(&mut buffer, "         {message}")?;
             }
             Level::Warn => {
                 buffer.set_color(ColorSpec::new().set_fg(Some(Color::Yellow)))?;
-                write!(&mut buffer, "  [WARN] {}", message)?;
+                write!(&mut buffer, "  [WARN] {message}")?;
             }
         }
-        write!(&mut buffer, "\n")?;
+        writeln!(&mut buffer)?;
         buffer.reset()?;
         buf_writer.print(&buffer)
     }
@@ -85,9 +85,8 @@ impl LogStderrColors {
 
 impl AbstractLog for LogStderrColors {
     fn log(&self, level: Level, query_fingerprint: &str, message: impl fmt::Display) -> DataFusionResult<()> {
-        self.log_inner(level, query_fingerprint, message).map_err(|e| {
-            DataFusionError::Internal(format!("Failed to write to stderr: {}", e))
-        })
+        self.log_inner(level, query_fingerprint, message)
+            .map_err(|e| DataFusionError::Internal(format!("Failed to write to stderr: {e}")))
     }
 }
 

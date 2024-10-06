@@ -4,9 +4,11 @@ use std::fmt::Formatter;
 use std::hash::Hash;
 use std::sync::Arc;
 
+use crate::cache::QueryCacheEntry;
+use crate::log::{log_info, log_warn, AbstractLog};
+use crate::QueryCacheConfig;
 use async_trait::async_trait;
 use datafusion::arrow::array::RecordBatch;
-use datafusion::arrow::util::pretty::print_batches;
 use datafusion::common::tree_node::Transformed;
 use datafusion::common::{plan_err, Column, DFSchemaRef, Result as DataFusionResult};
 use datafusion::execution::{SendableRecordBatchStream, SessionState, TaskContext};
@@ -23,9 +25,6 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{collect, DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use datafusion::physical_planner::{ExtensionPlanner, PhysicalPlanner};
 use futures::TryFutureExt;
-use crate::cache::QueryCacheEntry;
-use crate::log::{log_info, log_warn, AbstractLog};
-use crate::QueryCacheConfig;
 
 #[derive(Debug)]
 pub(crate) struct QCAggregateOptimizerRule<Log: AbstractLog> {
@@ -110,14 +109,14 @@ impl<Log: AbstractLog> OptimizerRule for QCAggregateOptimizerRule<Log> {
         };
         // TODO, maybe we need to check the input is a table scan?
         self.log.info(&fingerprint, "query valid for caching")?;
-        return Ok(Transformed::yes(LogicalPlan::Extension(Extension {
+        Ok(Transformed::yes(LogicalPlan::Extension(Extension {
             node: Arc::new(QCAggregatePlanNode::new(
                 plan.clone(),
                 temporal_group_by,
                 dynamic_lower_bound,
                 Some(fingerprint),
             )?),
-        })));
+        })))
     }
 }
 
@@ -258,20 +257,30 @@ impl<Log: AbstractLog> ExtensionPlanner for QCAggregateExecPlanner<Log> {
         }
 
         let Some(agg_exec): Option<&AggregateExec> = exec.as_any().downcast_ref() else {
-            log_warn!(self.log, &agg_node.fingerprint, "QueryCacheGroupByExec expected one AggregateExec input, found {}", exec.name());
+            log_warn!(
+                self.log,
+                &agg_node.fingerprint,
+                "QueryCacheGroupByExec expected one AggregateExec input, found {}",
+                exec.name()
+            );
             return Ok(Some(exec));
         };
 
         let cache_entry = self.config.cache().entry(&agg_node.fingerprint).await?;
-        log_info!(self.log, &agg_node.fingerprint, "cache entry hit {:?}", cache_entry.occupied());
+        log_info!(
+            self.log,
+            &agg_node.fingerprint,
+            "cache entry hit {:?}",
+            cache_entry.occupied()
+        );
 
-        let input_exec = QCInnerAggregateExec::new(
+        let input_exec = QCInnerAggregateExec::new_exec_plan(
             self.log.clone(),
             cache_entry,
             agg_exec.input().clone(),
             agg_node.temporal_group_by.clone(),
             agg_node.dynamic_lower_bound.clone(),
-        )?;
+        );
 
         // let input_exec = Arc::new(CoalescePartitionsExec::new(input_exec));
         let input_schema = input_exec.schema();
@@ -318,13 +327,13 @@ struct QCInnerAggregateExec<Log: AbstractLog> {
 }
 
 impl<Log: AbstractLog> QCInnerAggregateExec<Log> {
-    fn new(
+    fn new_exec_plan(
         log: Log,
         cache_entry: Arc<dyn QueryCacheEntry>,
         input: Arc<dyn ExecutionPlan>,
         temporal_group_by: Column,
         dynamic_lower_bound: Option<BinaryExpr>,
-    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+    ) -> Arc<dyn ExecutionPlan> {
         let properties = input.properties().clone();
 
         let input = if input.name() == "CoalescePartitionsExec" {
@@ -333,14 +342,14 @@ impl<Log: AbstractLog> QCInnerAggregateExec<Log> {
             Arc::new(CoalescePartitionsExec::new(input))
         };
 
-        Ok(Arc::new(Self {
+        Arc::new(Self {
             log,
             cache_entry,
             input,
             temporal_group_by,
             dynamic_lower_bound,
             properties,
-        }))
+        })
     }
 }
 
@@ -348,7 +357,7 @@ impl<Log: AbstractLog> DisplayAs for QCInnerAggregateExec<Log> {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut Formatter) -> fmt::Result {
         match t {
             DisplayFormatType::Default => write!(f, "{}({})", self.name(), self.input.name()),
-            DisplayFormatType::Verbose => write!(f, "{:?}", self),
+            DisplayFormatType::Verbose => write!(f, "{self:?}"),
         }
     }
 }
@@ -376,13 +385,13 @@ impl<Log: AbstractLog> ExecutionPlan for QCInnerAggregateExec<Log> {
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         if children.len() == 1 {
-            Self::new(
+            Ok(Self::new_exec_plan(
                 self.log.clone(),
-                self.cache_entry.clone(),  // TODO is it safe to reuse the cache entry?
+                self.cache_entry.clone(), // TODO is it safe to reuse the cache entry?
                 children[0].clone(),
                 self.temporal_group_by.clone(),
                 self.dynamic_lower_bound.clone(),
-            )
+            ))
         } else {
             plan_err!("QueryCacheGroupByExec expected one child")
         }
@@ -399,9 +408,13 @@ impl<Log: AbstractLog> ExecutionPlan for QCInnerAggregateExec<Log> {
     }
 }
 
-async fn async_execute(input: Arc<dyn ExecutionPlan>, cache_entry: Arc<dyn QueryCacheEntry>, context: Arc<TaskContext>) -> DataFusionResult<Vec<RecordBatch>> {
+async fn async_execute(
+    input: Arc<dyn ExecutionPlan>,
+    cache_entry: Arc<dyn QueryCacheEntry>,
+    context: Arc<TaskContext>,
+) -> DataFusionResult<Vec<RecordBatch>> {
     if let Some(batches) = cache_entry.get().await? {
-        return Ok(batches.clone());
+        Ok(batches.to_vec())
     } else {
         let batches = collect(input, context).await?;
         // store the result for future use
@@ -436,13 +449,13 @@ impl DynamicLowerBound {
             | Expr::IsTrue(_)
             | Expr::IsFalse(_)
             | Expr::IsNotTrue(_)
-            | Expr::IsNotFalse(_) => Self::Stable,
+            | Expr::IsNotFalse(_)
+            | Expr::Column(_) => Self::Stable,
             Expr::Not(e) | Expr::Negative(e) => match Self::find(e, column) {
                 Self::Stable => Self::Stable,
                 _ => Self::Abandon,
             },
             Expr::ScalarFunction(scalar) => Self::find_scalar_function(scalar),
-            Expr::Column(_) => Self::Stable,
             // TODO there are other allowed cases
             _ => Self::Abandon,
         }
@@ -503,7 +516,7 @@ impl DynamicLowerBound {
 
         let left = Self::find(left, column);
         let right = Self::find(right, column);
-        return left.either(right);
+        left.either(right)
     }
 
     fn find_between(_between: &Between, _column: &Column) -> Self {
@@ -519,6 +532,7 @@ impl DynamicLowerBound {
     }
 
     /// Find the value which is more important
+    #[allow(clippy::match_same_arms)]
     fn either(self, other: Self) -> Self {
         match (self, other) {
             (Self::Abandon, _) | (_, Self::Abandon) => Self::Abandon,
