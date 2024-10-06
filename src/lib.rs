@@ -22,6 +22,7 @@ pub use log::{LogNoOp, LogStderrColors};
 pub struct QueryCacheConfig {
     temporal_columns: HashSet<Column>,
     group_by_functions: HashSet<String>,
+    override_now: Option<i64>,
     cache: Arc<dyn QueryCache>,
 }
 
@@ -30,6 +31,7 @@ impl QueryCacheConfig {
         Self {
             cache,
             temporal_columns: HashSet::new(),
+            override_now: None,
             group_by_functions: HashSet::new(),
         }
     }
@@ -38,6 +40,7 @@ impl QueryCacheConfig {
         self.temporal_columns.insert(column);
         self
     }
+
     pub fn with_temporal_column_table_col(
         mut self,
         table_name: impl Into<String>,
@@ -45,6 +48,11 @@ impl QueryCacheConfig {
     ) -> Self {
         let column = Column::new(Some(table_name.into()), column_name.into());
         self.temporal_columns.insert(column);
+        self
+    }
+
+    pub fn with_override_now(mut self, timestamp: Option<i64>) -> Self {
+        self.override_now = timestamp;
         self
     }
 

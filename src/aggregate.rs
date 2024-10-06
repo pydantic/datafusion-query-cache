@@ -124,6 +124,10 @@ impl<Log: AbstractLog> OptimizerRule for QCAggregateOptimizerRule<Log> {
         //     return Ok(Transformed::no(plan));
         // }
 
+        if dynamic_lower_bound.is_some() {
+            return plan_err!("dynamic lower bound not yet supported");
+        }
+
         // do we need to check the input is a table scan?
         self.log.info(&fingerprint, "query valid for caching")?;
         Ok(Transformed::yes(LogicalPlan::Extension(Extension {
@@ -295,19 +299,21 @@ impl<Log: AbstractLog> ExtensionPlanner for QCAggregateExecPlanner<Log> {
             cache_entry.occupied()
         );
 
-        let now = session_state
-            .execution_props()
-            .query_execution_start_time
-            .timestamp_nanos_opt()
-            // we'll be in trouble after 2262!
-            .unwrap();
+        let now = self.config.override_now.unwrap_or_else(|| {
+            session_state
+                .execution_props()
+                .query_execution_start_time
+                .timestamp_nanos_opt()
+                // we'll be in trouble after 2262!
+                .unwrap()
+        });
 
         let partial_agg_exec = agg_exec.input().clone();
 
         let input_exec = match &cache_entry {
             CacheEntry::Occupied(entry) => {
                 let cached_exec = CachedAggregateExec::new_exec_plan(entry.clone(), partial_agg_exec.properties());
-                let new_exec = with_lower_bound(&partial_agg_exec, &agg_node.temporal_group_by, now)?;
+                let new_exec = with_lower_bound(&partial_agg_exec, &agg_node.temporal_group_by, entry.timestamp())?;
 
                 let combined_input = Arc::new(UnionExec::new(vec![cached_exec, new_exec]));
                 Arc::new(CoalescePartitionsExec::new(combined_input))
