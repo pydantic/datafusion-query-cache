@@ -81,41 +81,44 @@ impl OptimizerRule for QCAggregateOptimizerRule {
 
         let Some(temporal_group_by) = temporal_group_bys.next() else {
             // no temporal group by, do nothing
+            eprintln!("no temporal group by, do nothing");
             return Ok(Transformed::no(plan));
         };
         if temporal_group_bys.next().is_some() {
             // multiple group bys using temporal columns!
             // I've no idea if this is even possible, and what we could do if it is, do nothing for now
+            eprintln!("multiple group bys using temporal columns!");
             return Ok(Transformed::no(plan));
         }
 
         let dynamic_lower_bound = if let LogicalPlan::Filter(filter) = &agg_input {
-            // TODO, check the input is a table scan
             match DynamicLowerBound::find(&filter.predicate, &temporal_group_by) {
                 DynamicLowerBound::Found(bin_expr) => Some(bin_expr),
                 DynamicLowerBound::Stable => None,
                 _ => {
                     // we found an unstable expression, we can't rewrite the plan
+                    eprintln!("we found an unstable expression, we can't rewrite the plan");
                     return Ok(Transformed::no(plan));
                 }
             }
         } else {
-            // TODO, check the input is a table scan
             None
         };
+        // TODO, maybe we need to check the input is a table scan?
         return Ok(Transformed::yes(LogicalPlan::Extension(Extension {
             node: Arc::new(QCAggregatePlanNode::new(
                 plan.clone(),
                 temporal_group_by,
                 dynamic_lower_bound,
-            )),
+            )?),
         })));
     }
 }
 
-#[derive(Debug, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd)]
 struct QCAggregatePlanNode {
     input: LogicalPlan,
+    unique_desc: String,
     temporal_group_by: Column,
     dynamic_lower_bound: Option<BinaryExpr>,
 }
@@ -127,18 +130,35 @@ impl fmt::Display for QCAggregatePlanNode {
 }
 
 impl QCAggregatePlanNode {
-    fn new(input: LogicalPlan, temporal_group_by: Column, dynamic_lower_bound: Option<BinaryExpr>) -> Self {
-        Self {
-            input,
-            temporal_group_by,
-            dynamic_lower_bound,
+    fn new(
+        input: LogicalPlan,
+        temporal_group_by: Column,
+        dynamic_lower_bound: Option<BinaryExpr>,
+    ) -> DataFusionResult<Self> {
+        if let LogicalPlan::Extension(e) = input {
+            if let Some(node) = e.node.as_any().downcast_ref::<QCAggregatePlanNode>() {
+                // already a `QCAggregatePlanNode`, return it
+                Ok(node.clone())
+            } else {
+                plan_err!("unexpected extension node, expected QCAggregatePlanNode")
+            }
+        } else if matches!(input, LogicalPlan::Aggregate(..)) {
+            let unique_desc = format!("QueryCacheAggregate: {}", input.display_indent_schema());
+            Ok(Self {
+                input,
+                unique_desc,
+                temporal_group_by,
+                dynamic_lower_bound,
+            })
+        } else {
+            plan_err!("unexpected input to QCAggregatePlanNode, mut be Aggregate or Extension(QCAggregatePlanNode)")
         }
     }
 }
 
 impl UserDefinedLogicalNodeCore for QCAggregatePlanNode {
     fn name(&self) -> &str {
-        "QueryCacheGroupBy"
+        "QueryCacheAggregate"
     }
 
     fn inputs(&self) -> Vec<&LogicalPlan> {
@@ -159,7 +179,7 @@ impl UserDefinedLogicalNodeCore for QCAggregatePlanNode {
     }
 
     fn fmt_for_explain(&self, f: &mut Formatter) -> fmt::Result {
-        write!(f, "group by cache for {}", self.input.display())
+        write!(f, "QueryCacheAggregate: {}", self.input.display())
     }
 
     fn with_exprs_and_inputs(&self, exprs: Vec<Expr>, inputs: Vec<LogicalPlan>) -> DataFusionResult<Self> {
@@ -188,7 +208,7 @@ impl UserDefinedLogicalNodeCore for QCAggregatePlanNode {
         if iter_inputs.next().is_some() {
             plan_err!("too many inputs")
         } else {
-            Ok(Self::new(input, column, dynamic_lower_bound))
+            Self::new(input, column, dynamic_lower_bound)
         }
     }
 }
@@ -226,7 +246,7 @@ impl ExtensionPlanner for QCAggregateExecPlanner {
             return plan_err!("QueryCacheGroupByExec expected one AggregateExec input");
         };
 
-        let input_exec = QCInnerAggregateExec::try_new(
+        let input_exec = QCInnerAggregateExec::new(
             agg_exec.input().clone(),
             group_by_node.temporal_group_by.clone(),
             group_by_node.dynamic_lower_bound.clone(),
@@ -275,7 +295,7 @@ struct QCInnerAggregateExec {
 }
 
 impl QCInnerAggregateExec {
-    fn try_new(
+    fn new(
         input: Arc<dyn ExecutionPlan>,
         temporal_group_by: Column,
         dynamic_lower_bound: Option<BinaryExpr>,
@@ -329,7 +349,7 @@ impl ExecutionPlan for QCInnerAggregateExec {
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         if children.len() == 1 {
-            Self::try_new(
+            Self::new(
                 children[0].clone(),
                 self.temporal_group_by.clone(),
                 self.dynamic_lower_bound.clone(),
@@ -389,6 +409,7 @@ impl DynamicLowerBound {
                 _ => Self::Abandon,
             },
             Expr::ScalarFunction(scalar) => Self::find_scalar_function(scalar),
+            Expr::Column(_) => Self::Stable,
             // TODO there are other allowed cases
             _ => Self::Abandon,
         }
@@ -438,18 +459,18 @@ impl DynamicLowerBound {
             }
             // AND or a simple arithmetic operation, check both sides
             Operator::And
+            | Operator::Eq
             | Operator::Plus
             | Operator::Minus
             | Operator::Multiply
             | Operator::Divide
-            | Operator::Modulo => {
-                let left = Self::find(left, column);
-                let right = Self::find(right, column);
-                return left.either(right);
-            }
-            _ => (),
+            | Operator::Modulo => (),
+            _ => return Self::Abandon,
         };
-        Self::Abandon
+
+        let left = Self::find(left, column);
+        let right = Self::find(right, column);
+        return left.either(right);
     }
 
     fn find_between(_between: &Between, _column: &Column) -> Self {

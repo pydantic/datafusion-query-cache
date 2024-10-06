@@ -15,8 +15,9 @@ async fn main() {
     let input_batch = create_data();
     ctx.register_batch("records", input_batch.clone()).unwrap();
 
-    let sql = "SELECT date_trunc('hour', timestamp), avg(value), count(*) from records group by 1 order by 1 desc";
+    let sql = "SELECT date_trunc('hour', timestamp), avg(value), count(*) from records where value>1 group by 1 order by 1 desc";
     let df = ctx.sql(sql).await.unwrap();
+    // dbg!(df.logical_plan());
     let batches = df.collect().await.unwrap();
     print_batches(&batches).unwrap();
 }
