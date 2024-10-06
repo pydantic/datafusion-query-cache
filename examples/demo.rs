@@ -2,13 +2,13 @@ use chrono::{DateTime, FixedOffset};
 use datafusion::arrow::array::{Int64Array, RecordBatch, StringArray, TimestampNanosecondArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use datafusion::arrow::util::pretty::print_batches;
+use datafusion::common::Column;
 use datafusion::datasource::MemTable;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::execution::SessionStateBuilder;
 use datafusion::prelude::{SessionConfig, SessionContext};
-use std::sync::Arc;
-
 use datafusion_query_cache::{with_query_cache_log, LogStderrColors, MemoryQueryCache, QueryCacheConfig};
+use std::sync::Arc;
 
 #[tokio::main]
 async fn main() {
@@ -21,7 +21,9 @@ async fn main() {
     let table = MemTable::try_new(batch1.schema(), vec![vec![batch1.clone()]]).unwrap();
     ctx.register_table("records", Arc::new(table)).unwrap();
 
-    let sql = "SELECT date_trunc('hour', timestamp), round(avg(value), 2), count(*) from records where value>1 group by 1 order by 1 desc";
+    // let sql = "SELECT date_trunc('hour', timestamp), round(avg(value), 2), count(*) from records where value>1 group by 1 order by 1 desc";
+
+    let sql = "SELECT round(avg(value), 2), count(*) from records where value>1 order by 1 desc";
 
     let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
     println!("first run:");
@@ -58,18 +60,20 @@ async fn main() {
         .unwrap()
         .value(0);
     println!("\nEXPLAIN ANALYZE:\n{}", plan);
+
+    // dbg!(cache);
 }
 
 async fn session_ctx(cache: Arc<MemoryQueryCache>, override_now: Option<i64>) -> SessionContext {
-    let config = SessionConfig::new();
+    let config = SessionConfig::new().with_target_partitions(10);
     let runtime = Arc::new(RuntimeEnv::default());
     let state_builder = SessionStateBuilder::new()
         .with_config(config)
         .with_runtime_env(runtime)
         .with_default_features();
 
-    let query_cache_config = QueryCacheConfig::new(cache)
-        .with_temporal_column_table_col("records", "timestamp")
+    let sort_col = Column::new(Some("records".to_string()), "timestamp".to_string());
+    let query_cache_config = QueryCacheConfig::new(sort_col, cache)
         .with_group_by_function("date_trunc")
         .with_override_now(override_now);
 

@@ -20,6 +20,7 @@ pub use log::{LogNoOp, LogStderrColors};
 
 #[derive(Debug)]
 pub struct QueryCacheConfig {
+    default_sort_column: Column,
     temporal_columns: HashSet<Column>,
     group_by_functions: HashSet<String>,
     override_now: Option<i64>,
@@ -27,26 +28,18 @@ pub struct QueryCacheConfig {
 }
 
 impl QueryCacheConfig {
-    pub fn new(cache: Arc<dyn QueryCache>) -> Self {
+    pub fn new(default_sort_column: Column, cache: Arc<dyn QueryCache>) -> Self {
+        let temporal_columns = HashSet::from([default_sort_column.clone()]);
         Self {
-            cache,
-            temporal_columns: HashSet::new(),
+            default_sort_column,
+            temporal_columns,
             override_now: None,
             group_by_functions: HashSet::new(),
+            cache,
         }
     }
 
     pub fn with_temporal_column(mut self, column: Column) -> Self {
-        self.temporal_columns.insert(column);
-        self
-    }
-
-    pub fn with_temporal_column_table_col(
-        mut self,
-        table_name: impl Into<String>,
-        column_name: impl Into<String>,
-    ) -> Self {
-        let column = Column::new(Some(table_name.into()), column_name.into());
         self.temporal_columns.insert(column);
         self
     }
@@ -59,6 +52,10 @@ impl QueryCacheConfig {
     pub fn with_group_by_function(mut self, function: impl Into<String>) -> Self {
         self.group_by_functions.insert(function.into());
         self
+    }
+
+    pub(crate) fn default_sort_column(&self) -> &Column {
+        &self.default_sort_column
     }
 
     pub(crate) fn allow_group_by_function(&self, function: &str) -> bool {

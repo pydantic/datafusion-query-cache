@@ -1,9 +1,11 @@
-use async_trait::async_trait;
-use datafusion::arrow::array::RecordBatch;
-use datafusion::common::Result as DataFusionResult;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};
+
+use async_trait::async_trait;
+use datafusion::arrow::array::RecordBatch;
+use datafusion::arrow::util::pretty::pretty_format_batches;
+use datafusion::common::Result as DataFusionResult;
 
 #[async_trait]
 pub trait QueryCache: Send + Sync + fmt::Debug {
@@ -47,10 +49,21 @@ pub trait VacantCacheEntry: Send + Sync + fmt::Debug {
     async fn put(&self, timestamp: i64, record_batch: &[RecordBatch]) -> DataFusionResult<()>;
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 #[allow(clippy::type_complexity)]
 pub struct MemoryQueryCache {
     cache: Arc<Mutex<HashMap<String, (i64, Arc<Vec<RecordBatch>>)>>>,
+}
+
+impl fmt::Debug for MemoryQueryCache {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(f, "MemoryQueryCache{{")?;
+        for (fingerprint, (timestamp, record_batch)) in self.cache.lock().unwrap().iter() {
+            let table = pretty_format_batches(record_batch).map_err(|_| fmt::Error)?;
+            writeln!(f, "{fingerprint}\ntimestamp: {timestamp} data:\n{table}\n")?;
+        }
+        writeln!(f, "}}")
+    }
 }
 
 impl MemoryQueryCache {

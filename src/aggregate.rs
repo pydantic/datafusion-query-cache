@@ -1,4 +1,6 @@
 use std::any::Any;
+use std::borrow::Cow;
+use std::collections::HashSet;
 use std::fmt;
 use std::fmt::Formatter;
 use std::hash::Hash;
@@ -12,7 +14,7 @@ use datafusion::common::{internal_err, plan_err, Column, DFSchemaRef, Result as 
 use datafusion::execution::{SendableRecordBatchStream, SessionState, TaskContext};
 use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::logical_expr::{
-    Aggregate, Between, BinaryExpr, Expr, Extension, LogicalPlan, Operator, UserDefinedLogicalNode,
+    Aggregate, Between, BinaryExpr, Expr, Extension, Filter, LogicalPlan, Operator, TableScan, UserDefinedLogicalNode,
     UserDefinedLogicalNodeCore,
 };
 use datafusion::optimizer::optimizer::ApplyOrder;
@@ -74,24 +76,23 @@ impl<Log: AbstractLog> OptimizerRule for QCAggregateOptimizerRule<Log> {
     }
 
     // Example rewrite pass to insert a user defined LogicalPlanNode
-    fn rewrite(&self, plan: LogicalPlan, _config: &dyn OptimizerConfig) -> DataFusionResult<Transformed<LogicalPlan>> {
+    fn rewrite(
+        &self,
+        mut plan: LogicalPlan,
+        _config: &dyn OptimizerConfig,
+    ) -> DataFusionResult<Transformed<LogicalPlan>> {
         // println!("rewrite -> {}", plan.display());
         let LogicalPlan::Aggregate(agg) = &plan else {
             // not an aggregation, continue rewrite
             return Ok(Transformed::no(plan));
         };
-        let fingerprint = plan.display_indent_schema().to_string();
+        let mut fingerprint = plan.display_indent_schema().to_string();
 
         let Aggregate { input, group_expr, .. } = agg;
         let agg_input = input.as_ref().clone();
         let mut temporal_group_bys = group_expr.iter().filter_map(|e| self.find_temporal_group_by(e));
 
-        let Some(temporal_group_by) = temporal_group_bys.next() else {
-            // TODO we should support this
-            self.log
-                .info(&fingerprint, "no temporal group by, caching not YET possible")?;
-            return Ok(Transformed::no(plan));
-        };
+        let temporal_group_by = temporal_group_bys.next();
 
         if temporal_group_bys.next().is_some() {
             // I've no idea if this is even possible, and what we could do if it is, do nothing for now
@@ -102,8 +103,14 @@ impl<Log: AbstractLog> OptimizerRule for QCAggregateOptimizerRule<Log> {
             return Ok(Transformed::no(plan));
         }
 
-        let dynamic_lower_bound = if let LogicalPlan::Filter(filter) = &agg_input {
-            match DynamicLowerBound::find(&filter.predicate, &temporal_group_by) {
+        let (dynamic_lower_bound, input) = if let LogicalPlan::Filter(filter) = &agg_input {
+            let needle_columns = if let Some(temporal_group_by) = &temporal_group_by {
+                Cow::Owned(HashSet::from([temporal_group_by.clone()]))
+            } else {
+                Cow::Borrowed(&self.config.temporal_columns)
+            };
+
+            let dlb = match DynamicLowerBound::find(&filter.predicate, &needle_columns) {
                 DynamicLowerBound::Found(bin_expr) => Some(bin_expr),
                 DynamicLowerBound::Stable => None,
                 _ => {
@@ -112,10 +119,64 @@ impl<Log: AbstractLog> OptimizerRule for QCAggregateOptimizerRule<Log> {
                         .info(&fingerprint, "we found an unstable expression, caching not possible")?;
                     return Ok(Transformed::no(plan));
                 }
-            }
+            };
+            (dlb, filter.input.as_ref().clone())
         } else {
-            None
+            (None, agg_input.clone())
         };
+
+        if temporal_group_by.is_none() {
+            // if temporal_group_by is none, we need to make sure the sort column is in the projection
+            let LogicalPlan::TableScan(scan) = input else {
+                // TODO we need to support this, e.g. a subquery
+                self.log
+                    .info(&fingerprint, "input not a table scan, caching not possible")?;
+                return Ok(Transformed::no(plan));
+            };
+            // TODO check table name
+            let field_name = self.config.default_sort_column().name.clone();
+            if !scan.projected_schema.fields().iter().any(|f| f.name() == &field_name) {
+                let new_col_id = scan
+                    .source
+                    .schema()
+                    .fields()
+                    .iter()
+                    .enumerate()
+                    .find_map(|(id, f)| (f.name() == &field_name).then_some(id));
+
+                let Some(new_col_id) = new_col_id else {
+                    self.log
+                        .info(&fingerprint, "sort column not found in table, caching not possible")?;
+                    return Ok(Transformed::no(plan));
+                };
+
+                let mut new_projection = scan.projection.unwrap();
+                new_projection.push(new_col_id);
+                new_projection.sort_unstable();
+
+                let new_table_scan = TableScan::try_new(
+                    scan.table_name,
+                    scan.source,
+                    Some(new_projection),
+                    scan.filters,
+                    scan.fetch,
+                )
+                .map(LogicalPlan::TableScan)?;
+
+                let inner_plan = if let LogicalPlan::Filter(filter) = &agg_input {
+                    LogicalPlan::Filter(Filter::try_new(filter.predicate.clone(), Arc::new(new_table_scan))?)
+                } else {
+                    new_table_scan
+                };
+                plan = LogicalPlan::Aggregate(Aggregate::try_new(
+                    Arc::new(inner_plan),
+                    agg.group_expr.clone(),
+                    agg.aggr_expr.clone(),
+                )?);
+                fingerprint = plan.display_indent_schema().to_string();
+            }
+        }
+
         // if dynamic_lower_bound.is_some() && temporal_group_by.is_none() {
         //     self.log.info(
         //         &fingerprint,
@@ -123,17 +184,23 @@ impl<Log: AbstractLog> OptimizerRule for QCAggregateOptimizerRule<Log> {
         //     )?;
         //     return Ok(Transformed::no(plan));
         // }
-
         if dynamic_lower_bound.is_some() {
             return plan_err!("dynamic lower bound not yet supported");
         }
 
+        let sort_column = temporal_group_by.unwrap_or_else(|| self.config.default_sort_column().clone());
+
         // do we need to check the input is a table scan?
-        self.log.info(&fingerprint, "query valid for caching")?;
+        log_info!(
+            self.log,
+            &fingerprint,
+            "query valid for caching, sort column {}",
+            sort_column
+        );
         Ok(Transformed::yes(LogicalPlan::Extension(Extension {
             node: Arc::new(QCAggregatePlanNode::new(
                 plan.clone(),
-                temporal_group_by,
+                sort_column,
                 dynamic_lower_bound,
                 Some(fingerprint),
             )?),
@@ -145,7 +212,7 @@ impl<Log: AbstractLog> OptimizerRule for QCAggregateOptimizerRule<Log> {
 struct QCAggregatePlanNode {
     input: LogicalPlan,
     fingerprint: String,
-    temporal_group_by: Column,
+    sort_column: Column,
     dynamic_lower_bound: Option<BinaryExpr>,
 }
 
@@ -159,7 +226,7 @@ impl fmt::Display for QCAggregatePlanNode {
 impl QCAggregatePlanNode {
     fn new(
         input: LogicalPlan,
-        temporal_group_by: Column,
+        sort_column: Column,
         dynamic_lower_bound: Option<BinaryExpr>,
         fingerprint: Option<String>,
     ) -> DataFusionResult<Self> {
@@ -175,11 +242,14 @@ impl QCAggregatePlanNode {
             Ok(Self {
                 input,
                 fingerprint,
-                temporal_group_by,
+                sort_column,
                 dynamic_lower_bound,
             })
         } else {
-            plan_err!("unexpected input to QCAggregatePlanNode, mut be Aggregate or Extension(QCAggregatePlanNode)")
+            plan_err!(
+                "unexpected input to QCAggregatePlanNode, mut be Aggregate or Extension(QCAggregatePlanNode), got {}",
+                input.display()
+            )
         }
     }
 }
@@ -198,8 +268,7 @@ impl UserDefinedLogicalNodeCore for QCAggregatePlanNode {
     }
 
     fn expressions(&self) -> Vec<Expr> {
-        // this should not include expressions from the input plan
-        let mut expressions = vec![Expr::Column(self.temporal_group_by.clone())];
+        let mut expressions = vec![Expr::Column(self.sort_column.clone())];
         if let Some(expr) = &self.dynamic_lower_bound {
             expressions.push(Expr::BinaryExpr(expr.clone()));
         }
@@ -313,7 +382,7 @@ impl<Log: AbstractLog> ExtensionPlanner for QCAggregateExecPlanner<Log> {
         let input_exec = match &cache_entry {
             CacheEntry::Occupied(entry) => {
                 let cached_exec = CachedAggregateExec::new_exec_plan(entry.clone(), partial_agg_exec.properties());
-                let new_exec = with_lower_bound(&partial_agg_exec, &agg_node.temporal_group_by, entry.timestamp())?;
+                let new_exec = with_lower_bound(&partial_agg_exec, &agg_node.sort_column, entry.timestamp())?;
 
                 let combined_input = Arc::new(UnionExec::new(vec![cached_exec, new_exec]));
                 Arc::new(CoalescePartitionsExec::new(combined_input))
@@ -629,10 +698,10 @@ enum DynamicLowerBound {
 }
 
 impl DynamicLowerBound {
-    fn find(expr: &Expr, column: &Column) -> Self {
+    fn find(expr: &Expr, columns: &HashSet<Column>) -> Self {
         match expr {
-            Expr::BinaryExpr(bin_expr) => Self::find_bin_expr(bin_expr, column),
-            Expr::Between(between) => Self::find_between(between, column),
+            Expr::BinaryExpr(bin_expr) => Self::find_bin_expr(bin_expr, columns),
+            Expr::Between(between) => Self::find_between(between, columns),
             Expr::Literal(_)
             | Expr::Like(_)
             | Expr::IsNotNull(_)
@@ -642,7 +711,7 @@ impl DynamicLowerBound {
             | Expr::IsNotTrue(_)
             | Expr::IsNotFalse(_)
             | Expr::Column(_) => Self::Stable,
-            Expr::Not(e) | Expr::Negative(e) => match Self::find(e, column) {
+            Expr::Not(e) | Expr::Negative(e) => match Self::find(e, columns) {
                 Self::Stable => Self::Stable,
                 _ => Self::Abandon,
             },
@@ -652,7 +721,7 @@ impl DynamicLowerBound {
         }
     }
 
-    fn find_bin_expr(bin_expr: &BinaryExpr, column: &Column) -> Self {
+    fn find_bin_expr(bin_expr: &BinaryExpr, columns: &HashSet<Column>) -> Self {
         let BinaryExpr { left, op, right } = bin_expr;
         match op {
             Operator::Gt | Operator::GtEq => {
@@ -660,8 +729,8 @@ impl DynamicLowerBound {
                 // `left` must be the column
                 // and `right` must be a dynamic bound
                 if let Expr::Column(col) = left.as_ref() {
-                    if col == column {
-                        return match Self::find(right, column) {
+                    if columns.contains(col) {
+                        return match Self::find(right, columns) {
                             Self::Stable => Self::Stable,
                             Self::FoundNow => Self::Found(bin_expr.clone()),
                             _ => Self::Abandon,
@@ -674,8 +743,8 @@ impl DynamicLowerBound {
                 // `left` must be a dynamic bound
                 // and `right` must be the column
                 if let Expr::Column(col) = right.as_ref() {
-                    if col == column {
-                        return match Self::find(left, column) {
+                    if columns.contains(col) {
+                        return match Self::find(left, columns) {
                             Self::Stable => Self::Stable,
                             Self::FoundNow => {
                                 let op = match op {
@@ -705,12 +774,12 @@ impl DynamicLowerBound {
             _ => return Self::Abandon,
         };
 
-        let left = Self::find(left, column);
-        let right = Self::find(right, column);
+        let left = Self::find(left, columns);
+        let right = Self::find(right, columns);
         left.either(right)
     }
 
-    fn find_between(_between: &Between, _column: &Column) -> Self {
+    fn find_between(_between: &Between, _columns: &HashSet<Column>) -> Self {
         todo!()
     }
 
