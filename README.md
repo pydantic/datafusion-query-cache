@@ -2,7 +2,7 @@
 
 **WIP this project is very early.**
 
-Crate to cache the intermediate results of queries on timeseries data in DataFusion.
+Cache the intermediate results of queries on timeseries data in DataFusion.
 
 What's supported:
 * [x] `GROUP BY` aggregation queries with a static lower bound
