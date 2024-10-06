@@ -3,6 +3,7 @@ use std::sync::Arc;
 use datafusion::arrow::array::{Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use datafusion::arrow::util::pretty::print_batches;
+use datafusion::datasource::MemTable;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::execution::SessionStateBuilder;
 use datafusion::prelude::{SessionConfig, SessionContext};
@@ -12,8 +13,9 @@ use datafusion_query_cache::{with_query_cache_log, LogStderrColors, MemoryQueryC
 #[tokio::main]
 async fn main() {
     let ctx = session_ctx().await;
-    let input_batch = create_data();
-    ctx.register_batch("records", input_batch.clone()).unwrap();
+    let batch = create_data();
+    let table = MemTable::try_new(batch.schema(), vec![vec![batch]]).unwrap();
+    ctx.register_table("records", Arc::new(table)).unwrap();
 
     let sql = "SELECT date_trunc('hour', timestamp), avg(value), count(*) from records where value>1 group by 1 order by 1 desc";
     let df = ctx.sql(sql).await.unwrap();
@@ -23,6 +25,19 @@ async fn main() {
     let df = ctx.sql(sql).await.unwrap();
     let batches = df.collect().await.unwrap();
     print_batches(&batches).unwrap();
+
+    let sql = format!("EXPLAIN ANALYZE {sql}");
+    let df = ctx.sql(&sql).await.unwrap();
+    let batches = df.collect().await.unwrap();
+
+    // second column, first value is the plan
+    let plan = batches[0]
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap()
+        .value(0);
+    println!("\nEXPLAIN ANALYZE:\n{}", plan);
 }
 
 async fn session_ctx() -> SessionContext {

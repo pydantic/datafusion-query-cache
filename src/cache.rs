@@ -7,58 +7,115 @@ use std::sync::{Arc, Mutex};
 
 #[async_trait]
 pub trait QueryCache: Send + Sync + fmt::Debug {
-    async fn entry(&self, query_fingerprint: &str) -> DataFusionResult<Arc<dyn QueryCacheEntry>>;
+    async fn entry(&self, query_fingerprint: &str) -> DataFusionResult<CacheEntry>;
+}
+
+#[derive(Debug, Clone)]
+pub enum CacheEntry {
+    Occupied(Arc<dyn OccupiedCacheEntry>),
+    Vacant(Arc<dyn VacantCacheEntry>),
+}
+
+impl CacheEntry {
+    pub fn occupied(&self) -> bool {
+        matches!(self, CacheEntry::Occupied(_))
+    }
+
+    pub async fn put(&self, timestamp: i64, record_batch: &[RecordBatch]) -> DataFusionResult<()> {
+        match self {
+            CacheEntry::Occupied(entry) => entry.put(timestamp, record_batch).await,
+            CacheEntry::Vacant(entry) => entry.put(timestamp, record_batch).await,
+        }
+    }
 }
 
 #[async_trait]
-pub trait QueryCacheEntry: Send + Sync + fmt::Debug {
-    fn occupied(&self) -> bool;
+pub trait OccupiedCacheEntry: Send + Sync + fmt::Debug {
+    /// The timestamp of the cache entry - e.g. when data was written to the cache.
+    fn timestamp(&self) -> i64;
 
-    async fn get(&self) -> DataFusionResult<Option<&[RecordBatch]>>;
+    /// Returns the record batch stored in this cache entry.
+    async fn get(&self) -> DataFusionResult<&[RecordBatch]>;
 
-    async fn put(&self, record_batch: &[RecordBatch]) -> DataFusionResult<()>;
+    /// Updates the record batch stored in this cache entry with a new timestamp.
+    async fn put(&self, timestamp: i64, record_batch: &[RecordBatch]) -> DataFusionResult<()>;
 }
 
-type MemoryHashmap = Arc<Mutex<HashMap<String, Arc<Vec<RecordBatch>>>>>;
-#[derive(Debug, Default)]
+#[async_trait]
+pub trait VacantCacheEntry: Send + Sync + fmt::Debug {
+    /// Set the record batch stored in this cache entry.
+    async fn put(&self, timestamp: i64, record_batch: &[RecordBatch]) -> DataFusionResult<()>;
+}
+
+#[derive(Debug, Clone, Default)]
+#[allow(clippy::type_complexity)]
 pub struct MemoryQueryCache {
-    cache: MemoryHashmap,
+    cache: Arc<Mutex<HashMap<String, (i64, Arc<Vec<RecordBatch>>)>>>,
+}
+
+impl MemoryQueryCache {
+    fn put(&self, fingerprint: &str, timestamp: i64, record_batch: &[RecordBatch]) {
+        let mut cache = self.cache.lock().unwrap();
+        cache.insert(fingerprint.to_owned(), (timestamp, Arc::new(record_batch.to_vec())));
+    }
 }
 
 #[async_trait]
 impl QueryCache for MemoryQueryCache {
-    async fn entry(&self, query_fingerprint: &str) -> DataFusionResult<Arc<dyn QueryCacheEntry>> {
+    async fn entry(&self, query_fingerprint: &str) -> DataFusionResult<CacheEntry> {
         let cache = self.cache.lock().unwrap();
-        let entry = cache.get(query_fingerprint).cloned();
-
-        Ok(Arc::new(MemoryQueryCacheEntry {
-            fingerprint: query_fingerprint.to_string(),
-            record_batch: entry,
-            cache: self.cache.clone(),
-        }))
+        if let Some((timestamp, record_batch)) = cache.get(query_fingerprint).cloned() {
+            let entry = OccupiedMemoryCacheEntry {
+                fingerprint: query_fingerprint.to_string(),
+                timestamp,
+                record_batch,
+                cache: self.clone(),
+            };
+            Ok(CacheEntry::Occupied(Arc::new(entry)))
+        } else {
+            let entry = VacantMemoryCacheEntry {
+                fingerprint: query_fingerprint.to_string(),
+                cache: self.clone(),
+            };
+            Ok(CacheEntry::Vacant(Arc::new(entry)))
+        }
     }
 }
 
 #[derive(Debug)]
-pub struct MemoryQueryCacheEntry {
+struct OccupiedMemoryCacheEntry {
     fingerprint: String,
-    record_batch: Option<Arc<Vec<RecordBatch>>>,
-    cache: MemoryHashmap,
+    timestamp: i64,
+    record_batch: Arc<Vec<RecordBatch>>,
+    cache: MemoryQueryCache,
 }
 
 #[async_trait]
-impl QueryCacheEntry for MemoryQueryCacheEntry {
-    fn occupied(&self) -> bool {
-        self.record_batch.is_some()
+impl OccupiedCacheEntry for OccupiedMemoryCacheEntry {
+    fn timestamp(&self) -> i64 {
+        self.timestamp
     }
 
-    async fn get(&self) -> DataFusionResult<Option<&[RecordBatch]>> {
-        Ok(self.record_batch.as_deref().map(std::vec::Vec::as_slice))
+    async fn get(&self) -> DataFusionResult<&[RecordBatch]> {
+        Ok(&self.record_batch)
     }
 
-    async fn put(&self, record_batch: &[RecordBatch]) -> DataFusionResult<()> {
-        let mut cache = self.cache.lock().unwrap();
-        cache.insert(self.fingerprint.clone(), Arc::new(record_batch.to_vec()));
+    async fn put(&self, timestamp: i64, record_batch: &[RecordBatch]) -> DataFusionResult<()> {
+        self.cache.put(&self.fingerprint, timestamp, record_batch);
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct VacantMemoryCacheEntry {
+    fingerprint: String,
+    cache: MemoryQueryCache,
+}
+
+#[async_trait]
+impl VacantCacheEntry for VacantMemoryCacheEntry {
+    async fn put(&self, timestamp: i64, record_batch: &[RecordBatch]) -> DataFusionResult<()> {
+        self.cache.put(&self.fingerprint, timestamp, record_batch);
         Ok(())
     }
 }
