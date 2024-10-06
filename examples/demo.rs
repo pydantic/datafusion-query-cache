@@ -23,7 +23,7 @@ async fn main() {
 
     // let sql = "SELECT date_trunc('hour', timestamp), round(avg(value), 2), count(*) from records where value>1 group by 1 order by 1 desc";
 
-    let sql = "SELECT round(avg(value), 2), count(*) from records where value>1 order by 1 desc";
+    let sql = "SELECT round(avg(value), 2), count(*) from records where value>1";
 
     let batches = ctx.sql(sql).await.unwrap().collect().await.unwrap();
     println!("first run:");
@@ -43,6 +43,7 @@ async fn main() {
     let ctx_simple = SessionContext::new();
     let table = MemTable::try_new(batch1.schema(), partitions.clone()).unwrap();
     ctx_simple.register_table("records", Arc::new(table)).unwrap();
+    // dbg!(ctx_simple.sql(sql).await.unwrap().create_physical_plan().await.unwrap());
 
     let batches = ctx_simple.sql(sql).await.unwrap().collect().await.unwrap();
     println!("second run with no caching:");
@@ -61,7 +62,7 @@ async fn main() {
         .value(0);
     println!("\nEXPLAIN ANALYZE:\n{}", plan);
 
-    // dbg!(cache);
+    // println!("{}", cache.display());
 }
 
 async fn session_ctx(cache: Arc<MemoryQueryCache>, override_now: Option<i64>) -> SessionContext {

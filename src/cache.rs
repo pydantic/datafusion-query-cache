@@ -57,12 +57,52 @@ pub struct MemoryQueryCache {
 
 impl fmt::Debug for MemoryQueryCache {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "MemoryQueryCache{{")?;
-        for (fingerprint, (timestamp, record_batch)) in self.cache.lock().unwrap().iter() {
-            let table = pretty_format_batches(record_batch).map_err(|_| fmt::Error)?;
-            writeln!(f, "{fingerprint}\ntimestamp: {timestamp} data:\n{table}\n")?;
+        #[derive(Debug)]
+        #[allow(dead_code)]
+        struct MemoryQueryCacheEntry {
+            timestamp: i64,
+            num_rows: usize,
         }
-        writeln!(f, "}}")
+        struct Entries<'a>(&'a MemoryQueryCache);
+
+        impl<'a> fmt::Debug for Entries<'a> {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                let binding = self.0.cache.lock().unwrap();
+                let entries = binding.iter().map(|(fingerprint, (ts, rb))| {
+                    (
+                        fingerprint,
+                        MemoryQueryCacheEntry {
+                            timestamp: *ts,
+                            num_rows: rb.iter().map(RecordBatch::num_rows).sum(),
+                        },
+                    )
+                });
+                f.debug_map().entries(entries).finish()
+            }
+        }
+
+        f.debug_struct("MemoryQueryCache")
+            .field("entries", &Entries(self))
+            .finish()
+    }
+}
+
+impl MemoryQueryCache {
+    pub fn display(&self) -> String {
+        struct DisplayMemoryQueryCache<'a>(&'a MemoryQueryCache);
+
+        impl fmt::Display for DisplayMemoryQueryCache<'_> {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                writeln!(f, "## MemoryQueryCache:")?;
+                for (fingerprint, (timestamp, record_batch)) in self.0.cache.lock().unwrap().iter() {
+                    let table = pretty_format_batches(record_batch).map_err(|_| fmt::Error)?;
+                    writeln!(f, "{fingerprint}\ntimestamp: {timestamp} data:\n{table}")?;
+                }
+                Ok(())
+            }
+        }
+
+        DisplayMemoryQueryCache(self).to_string()
     }
 }
 
@@ -132,3 +172,5 @@ impl VacantCacheEntry for VacantMemoryCacheEntry {
         Ok(())
     }
 }
+
+// TODO disk cache

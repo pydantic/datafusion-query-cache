@@ -20,7 +20,7 @@ pub use log::{LogNoOp, LogStderrColors};
 
 #[derive(Debug)]
 pub struct QueryCacheConfig {
-    default_sort_column: Column,
+    default_temporal_column: Column,
     temporal_columns: HashSet<Column>,
     group_by_functions: HashSet<String>,
     override_now: Option<i64>,
@@ -28,10 +28,10 @@ pub struct QueryCacheConfig {
 }
 
 impl QueryCacheConfig {
-    pub fn new(default_sort_column: Column, cache: Arc<dyn QueryCache>) -> Self {
-        let temporal_columns = HashSet::from([default_sort_column.clone()]);
+    pub fn new(default_temporal_column: Column, cache: Arc<dyn QueryCache>) -> Self {
+        let temporal_columns = HashSet::from([default_temporal_column.clone()]);
         Self {
-            default_sort_column,
+            default_temporal_column,
             temporal_columns,
             override_now: None,
             group_by_functions: HashSet::new(),
@@ -54,8 +54,8 @@ impl QueryCacheConfig {
         self
     }
 
-    pub(crate) fn default_sort_column(&self) -> &Column {
-        &self.default_sort_column
+    pub(crate) fn default_temporal_column(&self) -> &Column {
+        &self.default_temporal_column
     }
 
     pub(crate) fn allow_group_by_function(&self, function: &str) -> bool {

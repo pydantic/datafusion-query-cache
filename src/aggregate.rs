@@ -134,7 +134,7 @@ impl<Log: AbstractLog> OptimizerRule for QCAggregateOptimizerRule<Log> {
                 return Ok(Transformed::no(plan));
             };
             // TODO check table name
-            let field_name = self.config.default_sort_column().name.clone();
+            let field_name = self.config.default_temporal_column().name.clone();
             if !scan.projected_schema.fields().iter().any(|f| f.name() == &field_name) {
                 let new_col_id = scan
                     .source
@@ -145,12 +145,16 @@ impl<Log: AbstractLog> OptimizerRule for QCAggregateOptimizerRule<Log> {
                     .find_map(|(id, f)| (f.name() == &field_name).then_some(id));
 
                 let Some(new_col_id) = new_col_id else {
-                    self.log
-                        .info(&fingerprint, "sort column not found in table, caching not possible")?;
+                    log_info!(
+                        self.log,
+                        &fingerprint,
+                        "sort column '{}' not found in table, caching not possible",
+                        field_name
+                    );
                     return Ok(Transformed::no(plan));
                 };
 
-                let mut new_projection = scan.projection.unwrap();
+                let mut new_projection = scan.projection.expect("no projection found");
                 new_projection.push(new_col_id);
                 new_projection.sort_unstable();
 
@@ -188,19 +192,19 @@ impl<Log: AbstractLog> OptimizerRule for QCAggregateOptimizerRule<Log> {
             return plan_err!("dynamic lower bound not yet supported");
         }
 
-        let sort_column = temporal_group_by.unwrap_or_else(|| self.config.default_sort_column().clone());
+        let temporal_column = temporal_group_by.unwrap_or_else(|| self.config.default_temporal_column().clone());
 
         // do we need to check the input is a table scan?
         log_info!(
             self.log,
             &fingerprint,
             "query valid for caching, sort column {}",
-            sort_column
+            temporal_column
         );
         Ok(Transformed::yes(LogicalPlan::Extension(Extension {
             node: Arc::new(QCAggregatePlanNode::new(
                 plan.clone(),
-                sort_column,
+                temporal_column,
                 dynamic_lower_bound,
                 Some(fingerprint),
             )?),
@@ -212,7 +216,7 @@ impl<Log: AbstractLog> OptimizerRule for QCAggregateOptimizerRule<Log> {
 struct QCAggregatePlanNode {
     input: LogicalPlan,
     fingerprint: String,
-    sort_column: Column,
+    temporal_column: Column,
     dynamic_lower_bound: Option<BinaryExpr>,
 }
 
@@ -226,7 +230,7 @@ impl fmt::Display for QCAggregatePlanNode {
 impl QCAggregatePlanNode {
     fn new(
         input: LogicalPlan,
-        sort_column: Column,
+        temporal_column: Column,
         dynamic_lower_bound: Option<BinaryExpr>,
         fingerprint: Option<String>,
     ) -> DataFusionResult<Self> {
@@ -242,7 +246,7 @@ impl QCAggregatePlanNode {
             Ok(Self {
                 input,
                 fingerprint,
-                sort_column,
+                temporal_column,
                 dynamic_lower_bound,
             })
         } else {
@@ -268,7 +272,7 @@ impl UserDefinedLogicalNodeCore for QCAggregatePlanNode {
     }
 
     fn expressions(&self) -> Vec<Expr> {
-        let mut expressions = vec![Expr::Column(self.sort_column.clone())];
+        let mut expressions = vec![Expr::Column(self.temporal_column.clone())];
         if let Some(expr) = &self.dynamic_lower_bound {
             expressions.push(Expr::BinaryExpr(expr.clone()));
         }
@@ -382,7 +386,7 @@ impl<Log: AbstractLog> ExtensionPlanner for QCAggregateExecPlanner<Log> {
         let input_exec = match &cache_entry {
             CacheEntry::Occupied(entry) => {
                 let cached_exec = CachedAggregateExec::new_exec_plan(entry.clone(), partial_agg_exec.properties());
-                let new_exec = with_lower_bound(&partial_agg_exec, &agg_node.sort_column, entry.timestamp())?;
+                let new_exec = with_lower_bound(&partial_agg_exec, &agg_node.temporal_column, entry.timestamp())?;
 
                 let combined_input = Arc::new(UnionExec::new(vec![cached_exec, new_exec]));
                 Arc::new(CoalescePartitionsExec::new(combined_input))
