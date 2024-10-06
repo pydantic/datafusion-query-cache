@@ -7,7 +7,7 @@ use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::execution::SessionStateBuilder;
 use datafusion::prelude::{SessionConfig, SessionContext};
 
-use datafusion_query_cache::{with_query_cache, QueryCacheConfig};
+use datafusion_query_cache::{with_query_cache_log, LogStderrColors, MemoryQueryCache, QueryCacheConfig};
 
 #[tokio::main]
 async fn main() {
@@ -17,7 +17,10 @@ async fn main() {
 
     let sql = "SELECT date_trunc('hour', timestamp), avg(value), count(*) from records where value>1 group by 1 order by 1 desc";
     let df = ctx.sql(sql).await.unwrap();
-    // dbg!(df.logical_plan());
+    let batches = df.collect().await.unwrap();
+    print_batches(&batches).unwrap();
+
+    let df = ctx.sql(sql).await.unwrap();
     let batches = df.collect().await.unwrap();
     print_batches(&batches).unwrap();
 }
@@ -30,11 +33,13 @@ async fn session_ctx() -> SessionContext {
         .with_runtime_env(runtime)
         .with_default_features();
 
-    let query_cache_config = QueryCacheConfig::default()
+    let cache = Arc::new(MemoryQueryCache::default());
+    let query_cache_config = QueryCacheConfig::new(cache)
         .with_temporal_column_table_col("records", "timestamp")
         .with_group_by_function("date_trunc");
 
-    let state_builder = with_query_cache(state_builder, query_cache_config);
+    let log = LogStderrColors::default();
+    let state_builder = with_query_cache_log(state_builder, query_cache_config, log);
     SessionContext::new_with_state(state_builder.build())
 }
 

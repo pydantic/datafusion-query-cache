@@ -8,4 +8,8 @@ async-trait = "0.1.83"
 #datafusion = "42.0.0"
 datafusion =  {git = "https://github.com/apache/datafusion.git"}
 futures = "0.3.31"
+# TODo this hsould be feature flagged
+termcolor = "1.4.1"
+
+[dev-dependencies]
 tokio = { version = "1.40.0", features = ["full"] }
