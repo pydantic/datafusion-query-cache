@@ -2,6 +2,8 @@
 
 **WIP this project is very early.**
 
+See [apache/datafusion#12779](https://github.com/apache/datafusion/issues/12779) for discussion.
+
 Cache the intermediate results of queries on timeseries data in DataFusion.
 
 ## How it works (the very quick version)
@@ -159,4 +161,4 @@ async fn session_ctx() -> SessionContext {
 }
 ```
 
-See [`examples/demo.rs](./examples/demo.rs) for a more complete working example.
+See [`examples/demo.rs`](./examples/demo.rs) for a more complete working example.
